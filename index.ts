@@ -23,6 +23,11 @@ interface GitHubHeaders {
   [key: string]: string;
 }
 
+type AttemptPromiseArgs<T, TCode extends string> = {
+  promise: Promise<T>;
+  code: TCode;
+};
+
 type LagError =
   | { code: "CONFIG_READ_FAILED"; error: unknown; path: string }
   | { code: "CONFIG_PARSE_FAILED"; error: unknown; raw: string }
@@ -78,6 +83,10 @@ interface PromptUserInputArgs {
 interface ConfirmPushArgs {
   remoteName: string;
 }
+
+interface ReadGhAuthTokenArgs {}
+
+interface ResolveAuthTokenArgs {}
 
 interface EnsureGitignoreArgs {
   cwd: string;
@@ -140,6 +149,123 @@ interface MainArgs {
 const CONFIG_DIR_NAME = "lag";
 const CONFIG_FILE_NAME = "config.json";
 const AGENTS_FILE_NAME = "AGENTS.md";
+let cachedAuthTokenPromise: Promise<string | undefined> | undefined;
+
+/*
+Attempts to resolve a promise and wraps the result in a neverthrow Result.
+Inputs: promise to resolve and an error code to use on failure.
+Outputs: Result containing the resolved value or a structured error.
+*/
+const attemptPromise = async <T, TCode extends string>(
+  args: AttemptPromiseArgs<T, TCode>,
+) => {
+  try {
+    const value = await args.promise;
+    return ok(value);
+  } catch (error) {
+    return err({
+      code: args.code,
+      error,
+    });
+  }
+};
+
+/*
+Attempts to read a GitHub token from the GitHub CLI.
+Inputs: none.
+Outputs: Result containing the token or undefined when unavailable.
+*/
+const readGhAuthToken = async (_args: ReadGhAuthTokenArgs) => {
+  const spawnResult = await attemptPromise({
+    promise: Promise.resolve().then(() =>
+      Bun.spawn(["gh", "auth", "token"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    ),
+    code: "GH_CLI_SPAWN_FAILED",
+  });
+  if (spawnResult.isErr()) {
+    return err(spawnResult.error);
+  }
+
+  const processResult = spawnResult.value;
+  if (!processResult.stdout || !processResult.stderr) {
+    return err({
+      code: "GH_CLI_OUTPUT_MISSING",
+      error: new Error("Missing gh output streams"),
+    });
+  }
+
+  const stdoutResult = await attemptPromise({
+    promise: new Response(processResult.stdout).text(),
+    code: "GH_CLI_READ_FAILED",
+  });
+  if (stdoutResult.isErr()) {
+    return err(stdoutResult.error);
+  }
+
+  const stderrResult = await attemptPromise({
+    promise: new Response(processResult.stderr).text(),
+    code: "GH_CLI_READ_FAILED",
+  });
+  if (stderrResult.isErr()) {
+    return err(stderrResult.error);
+  }
+
+  const exitResult = await attemptPromise({
+    promise: processResult.exited,
+    code: "GH_CLI_EXIT_FAILED",
+  });
+  if (exitResult.isErr()) {
+    return err(exitResult.error);
+  }
+
+  if (exitResult.value !== 0) {
+    return err({
+      code: "GH_CLI_EXIT_FAILED",
+      error: new Error("GitHub CLI returned a non-zero exit code"),
+      status: exitResult.value,
+      stderr: stderrResult.value.trim(),
+    });
+  }
+
+  const token = stdoutResult.value.trim();
+  if (!token) {
+    return ok(undefined);
+  }
+
+  return ok(token);
+};
+
+/*
+Resolves a GitHub token from the environment or GitHub CLI.
+Inputs: none.
+Outputs: token string or undefined (logs failures).
+*/
+const resolveAuthToken = async (_args: ResolveAuthTokenArgs) => {
+  if (!cachedAuthTokenPromise) {
+    cachedAuthTokenPromise = (async () => {
+      const envToken =
+        Bun.env.GITHUB_TOKEN ?? Bun.env.GH_TOKEN ?? Bun.env.GITHUB_PAT ?? "";
+      if (envToken.trim().length > 0) {
+        return envToken.trim();
+      }
+
+      const ghResult = await readGhAuthToken({});
+      if (ghResult.isErr()) {
+        console.warn("Failed to read GitHub CLI token.", {
+          error: ghResult.error,
+        });
+        return undefined;
+      }
+
+      return ghResult.value;
+    })();
+  }
+
+  return cachedAuthTokenPromise;
+};
 
 /*
 Builds the config path for lag.
@@ -227,9 +353,8 @@ Builds headers for GitHub API requests.
 Inputs: none.
 Outputs: headers including optional authorisation.
 */
-const getAuthHeaders = (_args: EmptyArgs) => {
-  const token =
-    Bun.env.GITHUB_TOKEN ?? Bun.env.GH_TOKEN ?? Bun.env.GITHUB_PAT ?? "";
+const getAuthHeaders = async (_args: EmptyArgs) => {
+  const token = (await resolveAuthToken({})) ?? "";
   const headers: GitHubHeaders = {
     Accept: "application/vnd.github+json",
     "User-Agent": "lag-cli",
@@ -332,7 +457,7 @@ Outputs: Result with gist response or a structured error.
 const fetchGist = async (args: FetchGistArgs) => {
   try {
     const response = await fetch(`https://api.github.com/gists/${args.gistId}`, {
-      headers: getAuthHeaders({}),
+      headers: await getAuthHeaders({}),
     });
     const body = await response.text();
     if (!response.ok) {
@@ -391,7 +516,7 @@ const readGistFileContent = async (args: ReadGistFileContentArgs) => {
   }
   try {
     const response = await fetch(args.file.raw_url, {
-      headers: getAuthHeaders({}),
+      headers: await getAuthHeaders({}),
     });
     const body = await response.text();
     if (!response.ok) {
@@ -557,7 +682,7 @@ const updateGistFile = async (args: UpdateGistFileArgs) => {
     const response = await fetch(`https://api.github.com/gists/${args.gistId}`, {
       method: "PATCH",
       headers: {
-        ...getAuthHeaders({}),
+        ...(await getAuthHeaders({})),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
