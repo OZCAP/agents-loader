@@ -1,0 +1,18 @@
+{
+  "name": "agents-loader",
+  "module": "index.ts",
+  "type": "module",
+  "bin": {
+    "lag": "index.ts"
+  },
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "neverthrow": "^8.2.0"
+  }
+}
