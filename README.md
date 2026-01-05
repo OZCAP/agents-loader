@@ -31,7 +31,7 @@ Pull the remote gist file into the local AGENTS.md. First run will prompt for th
 lag pull
 ```
 
-Push local changes back to the gist (prompts if needed):
+Push local changes back to the gist (prompts for confirmation):
 
 ```bash
 lag push [gist-url]
