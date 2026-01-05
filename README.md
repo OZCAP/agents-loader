@@ -43,6 +43,16 @@ You can also store the gist URL explicitly (prompts if omitted):
 lag set [gist-url]
 ```
 
+### Gist setup
+
+Before using `lag`, you'll need to create a GitHub gist. This is where your AGENTS.md will be stored that you want to use across projects:
+
+1. Go to [gist.github.com](https://gist.github.com)
+2. Create a new gist (ensure it's set to **private**)
+3. Add a single file named `AGENTS.md`
+4. Copy the gist URL from your browser address bar
+
+
 ## Notes
 
 - Requires `GITHUB_TOKEN` (or `GH_TOKEN`) for private gists.
