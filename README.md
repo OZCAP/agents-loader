@@ -25,14 +25,7 @@ the install directory with `LAG_INSTALL_DIR=/some/path ./install.sh`.
 
 ## Usage
 
-First run (store the gist URL and pull into the current directory). If you omit
-the URL, `lag` will prompt for it:
-
-```bash
-lag pull [gist-url]
-```
-
-Pull again later:
+Pull the remote gist file into the local AGENTS.md. First run will prompt for the gist URL.
 
 ```bash
 lag pull
