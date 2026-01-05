@@ -4,22 +4,24 @@ import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { err, ok } from "neverthrow";
 
-type Config = {
+interface Config {
   gistUrl: string;
-};
+}
 
-type GistFile = {
+interface GistFile {
   filename: string;
   raw_url: string;
   content?: string;
   truncated?: boolean;
-};
+}
 
-type GistResponse = {
+interface GistResponse {
   files: Record<string, GistFile>;
-};
+}
 
-type GitHubHeaders = Record<string, string>;
+interface GitHubHeaders {
+  [key: string]: string;
+}
 
 type LagError =
   | { code: "CONFIG_READ_FAILED"; error: unknown; path: string }
@@ -35,9 +37,98 @@ type LagError =
   | { code: "LOCAL_AGENTS_WRITE_FAILED"; error: unknown; path: string }
   | { code: "GITIGNORE_UPDATE_FAILED"; error: unknown; path: string }
   | { code: "PROMPT_FAILED"; error: unknown }
+  | { code: "PUSH_ABORTED"; error: unknown }
   | { code: "UNKNOWN_COMMAND"; error: unknown; command: string };
 
-type EmptyArgs = Record<string, never>;
+interface EmptyArgs {}
+
+interface ExtractGistIdArgs {
+  input: string;
+}
+
+interface ParseConfigArgs {
+  raw: unknown;
+}
+
+interface LoadConfigArgs {
+  configPath: string;
+}
+
+interface SaveConfigArgs {
+  configPath: string;
+  config: Config;
+}
+
+interface FetchGistArgs {
+  gistId: string;
+}
+
+interface PickAgentsFilenameArgs {
+  files: Record<string, GistFile>;
+}
+
+interface ReadGistFileContentArgs {
+  file: GistFile;
+}
+
+interface PromptUserInputArgs {
+  prompt: string;
+}
+
+interface ConfirmOverwriteIfNeededArgs {
+  remoteFile?: GistFile;
+  remoteName: string;
+  localContent: string;
+}
+
+interface EnsureGitignoreArgs {
+  cwd: string;
+}
+
+interface WriteAgentsFileArgs {
+  cwd: string;
+  content: string;
+}
+
+interface ReadLocalAgentsFileArgs {
+  cwd: string;
+}
+
+interface UpdateGistFileArgs {
+  gistId: string;
+  filename: string;
+  content: string;
+}
+
+interface ResolveGistArgs {
+  gistInput?: string;
+  configPath: string;
+}
+
+interface PullAgentsArgs {
+  gistId: string;
+  cwd: string;
+}
+
+interface PushAgentsArgs {
+  gistId: string;
+  cwd: string;
+}
+
+interface RunCommandArgs {
+  command: string;
+  gistArg?: string;
+  cwd: string;
+}
+
+interface RenderErrorMessageArgs {
+  error: LagError;
+}
+
+interface MainArgs {
+  argv: string[];
+  cwd: string;
+}
 
 const CONFIG_DIR_NAME = "lag";
 const CONFIG_FILE_NAME = "config.json";
@@ -80,7 +171,7 @@ Extracts a gist id from a URL or raw id string.
 Inputs: user-provided gist input.
 Outputs: Result with gist id or a structured error.
 */
-const extractGistId = (args: { input: string }) => {
+const extractGistId = (args: ExtractGistIdArgs) => {
   const trimmed = args.input.trim();
   if (!trimmed) {
     return err({
@@ -148,7 +239,7 @@ Validates the config payload from disk.
 Inputs: unknown parsed JSON value.
 Outputs: config when valid, otherwise undefined.
 */
-const parseConfig = (args: { raw: unknown }) => {
+const parseConfig = (args: ParseConfigArgs) => {
   if (!args.raw || typeof args.raw !== "object") {
     return undefined;
   }
@@ -164,7 +255,7 @@ Loads config from disk if present.
 Inputs: config file path.
 Outputs: Result with config or undefined if missing.
 */
-const loadConfig = async (args: { configPath: string }) => {
+const loadConfig = async (args: LoadConfigArgs) => {
   try {
     const file = Bun.file(args.configPath);
     const exists = await file.exists();
@@ -196,7 +287,7 @@ Writes config to disk.
 Inputs: config file path and config data.
 Outputs: Result signalling success or failure.
 */
-const saveConfig = async (args: { configPath: string; config: Config }) => {
+const saveConfig = async (args: SaveConfigArgs) => {
   try {
     await mkdir(dirname(args.configPath), { recursive: true });
     await Bun.write(args.configPath, JSON.stringify(args.config, null, 2));
@@ -215,7 +306,7 @@ Fetches a gist from the GitHub API.
 Inputs: gist id.
 Outputs: Result with gist response or a structured error.
 */
-const fetchGist = async (args: { gistId: string }) => {
+const fetchGist = async (args: FetchGistArgs) => {
   try {
     const response = await fetch(`https://api.github.com/gists/${args.gistId}`, {
       headers: getAuthHeaders({}),
@@ -254,7 +345,7 @@ Selects the agents filename from a gist file map.
 Inputs: gist files record.
 Outputs: matching filename or undefined.
 */
-const pickAgentsFilename = (args: { files: Record<string, GistFile> }) => {
+const pickAgentsFilename = (args: PickAgentsFilenameArgs) => {
   if (args.files[AGENTS_FILE_NAME]) {
     return AGENTS_FILE_NAME;
   }
@@ -271,7 +362,7 @@ Reads content for a gist file entry.
 Inputs: gist file metadata.
 Outputs: Result with file content or a structured error.
 */
-const readGistFileContent = async (args: { file: GistFile }) => {
+const readGistFileContent = async (args: ReadGistFileContentArgs) => {
   if (args.file.content && !args.file.truncated) {
     return ok(args.file.content);
   }
@@ -304,7 +395,7 @@ Prompts for a gist URL or id via stdin.
 Inputs: prompt text.
 Outputs: Result with trimmed input or a structured error.
 */
-const promptUserInput = async (args: { prompt: string }) => {
+const promptUserInput = async (args: PromptUserInputArgs) => {
   let rl: ReturnType<typeof createInterface> | undefined;
   try {
     rl = createInterface({
@@ -326,11 +417,50 @@ const promptUserInput = async (args: { prompt: string }) => {
 };
 
 /*
+Checks whether the remote file differs and confirms overwrite when needed.
+Inputs: optional remote file, local content, and remote filename.
+Outputs: Result indicating whether to proceed with an overwrite.
+*/
+const confirmOverwriteIfNeeded = async (
+  args: ConfirmOverwriteIfNeededArgs,
+) => {
+  if (!args.remoteFile) {
+    return ok(true);
+  }
+  const remoteContentResult = await readGistFileContent({
+    file: args.remoteFile,
+  });
+  if (remoteContentResult.isErr()) {
+    return err(remoteContentResult.error);
+  }
+  if (remoteContentResult.value === args.localContent) {
+    return ok(true);
+  }
+  console.warn(
+    `Warning: remote ${args.remoteName} differs from local ${AGENTS_FILE_NAME}. Continuing will overwrite the remote file with your local version.`,
+  );
+  const promptResult = await promptUserInput({
+    prompt: "Continue and overwrite remote? (y/N): ",
+  });
+  if (promptResult.isErr()) {
+    return err(promptResult.error);
+  }
+  const shouldOverwrite = (() => {
+    const answer = promptResult.value.trim().toLowerCase();
+    if (answer === "y" || answer === "yes") {
+      return true;
+    }
+    return false;
+  })();
+  return ok(shouldOverwrite);
+};
+
+/*
 Ensures AGENTS.md is ignored in the current directory.
 Inputs: working directory path.
 Outputs: Result indicating whether the update succeeded.
 */
-const ensureGitignore = async (args: { cwd: string }) => {
+const ensureGitignore = async (args: EnsureGitignoreArgs) => {
   const gitignorePath = join(args.cwd, ".gitignore");
   try {
     const file = Bun.file(gitignorePath);
@@ -364,7 +494,7 @@ Writes the AGENTS.md file into the current directory.
 Inputs: working directory and file content.
 Outputs: Result signalling success or failure.
 */
-const writeAgentsFile = async (args: { cwd: string; content: string }) => {
+const writeAgentsFile = async (args: WriteAgentsFileArgs) => {
   const targetPath = join(args.cwd, AGENTS_FILE_NAME);
   try {
     await Bun.write(targetPath, args.content);
@@ -383,7 +513,7 @@ Reads the local AGENTS.md or agents.md file.
 Inputs: working directory path.
 Outputs: Result with file path and content or a structured error.
 */
-const readLocalAgentsFile = async (args: { cwd: string }) => {
+const readLocalAgentsFile = async (args: ReadLocalAgentsFileArgs) => {
   const upperPath = join(args.cwd, AGENTS_FILE_NAME);
   const lowerPath = join(args.cwd, "agents.md");
   try {
@@ -416,11 +546,7 @@ Updates a gist file with new content.
 Inputs: gist id, filename, and content.
 Outputs: Result indicating whether the update succeeded.
 */
-const updateGistFile = async (args: {
-  gistId: string;
-  filename: string;
-  content: string;
-}) => {
+const updateGistFile = async (args: UpdateGistFileArgs) => {
   try {
     const response = await fetch(`https://api.github.com/gists/${args.gistId}`, {
       method: "PATCH",
@@ -461,10 +587,7 @@ Resolves the gist id from input or saved config.
 Inputs: optional gist input and config path.
 Outputs: Result with gist url and gist id.
 */
-const resolveGist = async (args: {
-  gistInput?: string;
-  configPath: string;
-}) => {
+const resolveGist = async (args: ResolveGistArgs) => {
   if (args.gistInput) {
     const gistIdResult = extractGistId({ input: args.gistInput });
     if (gistIdResult.isErr()) {
@@ -522,7 +645,7 @@ Pulls the remote gist file into the local AGENTS.md.
 Inputs: gist id and working directory.
 Outputs: Result indicating whether the pull succeeded.
 */
-const pullAgents = async (args: { gistId: string; cwd: string }) => {
+const pullAgents = async (args: PullAgentsArgs) => {
   const gistResult = await fetchGist({ gistId: args.gistId });
   if (gistResult.isErr()) {
     return err(gistResult.error);
@@ -567,7 +690,7 @@ Pushes the local AGENTS.md to the remote gist.
 Inputs: gist id and working directory.
 Outputs: Result indicating whether the push succeeded.
 */
-const pushAgents = async (args: { gistId: string; cwd: string }) => {
+const pushAgents = async (args: PushAgentsArgs) => {
   const localResult = await readLocalAgentsFile({ cwd: args.cwd });
   if (localResult.isErr()) {
     return err(localResult.error);
@@ -579,6 +702,21 @@ const pushAgents = async (args: { gistId: string; cwd: string }) => {
   const remoteName =
     pickAgentsFilename({ files: gistResult.value.files }) ??
     basename(localResult.value.path);
+  const remoteFile = gistResult.value.files[remoteName];
+  const overwriteResult = await confirmOverwriteIfNeeded({
+    remoteFile,
+    remoteName,
+    localContent: localResult.value.content,
+  });
+  if (overwriteResult.isErr()) {
+    return err(overwriteResult.error);
+  }
+  if (!overwriteResult.value) {
+    return err({
+      code: "PUSH_ABORTED",
+      error: new Error("Push cancelled"),
+    });
+  }
   const gitignoreResult = await ensureGitignore({ cwd: args.cwd });
   if (gitignoreResult.isErr()) {
     return err(gitignoreResult.error);
@@ -600,11 +738,7 @@ Runs a CLI command.
 Inputs: command, optional gist argument, and working directory.
 Outputs: Result indicating whether the command succeeded.
 */
-const runCommand = async (args: {
-  command: string;
-  gistArg?: string;
-  cwd: string;
-})  => {
+const runCommand = async (args: RunCommandArgs) => {
   const configPath = getConfigPath({});
   if (args.command === "set") {
     const gistInputResult = args.gistArg
@@ -662,7 +796,7 @@ Formats a structured error for display.
 Inputs: LagError value.
 Outputs: user-facing error message string.
 */
-const renderErrorMessage = (args: { error: LagError }) => {
+const renderErrorMessage = (args: RenderErrorMessageArgs) => {
   switch (args.error.code) {
     case "INVALID_GIST_URL":
       return "Invalid gist URL. Provide a valid gist URL or gist id.";
@@ -696,6 +830,8 @@ const renderErrorMessage = (args: { error: LagError }) => {
       return `Failed to update .gitignore at ${args.error.path}.`;
     case "PROMPT_FAILED":
       return "Failed to read input from stdin.";
+    case "PUSH_ABORTED":
+      return "Push cancelled.";
     default:
       return "Unexpected error.";
   }
@@ -706,7 +842,7 @@ Entry point for the CLI.
 Inputs: argv list and working directory.
 Outputs: none (process exits on failure).
 */
-const main = async (args: { argv: string[]; cwd: string }) => {
+const main = async (args: MainArgs) => {
   const [command, gistArg] = args.argv;
   if (
     !command ||
