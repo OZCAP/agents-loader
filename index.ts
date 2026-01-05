@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -6,6 +7,7 @@ import { err, ok } from "neverthrow";
 
 interface Config {
   gistUrl: string;
+  lastSyncedHash?: string;
 }
 
 interface GistFile {
@@ -35,6 +37,7 @@ type LagError =
   | { code: "LOCAL_AGENTS_NOT_FOUND"; error: unknown }
   | { code: "LOCAL_AGENTS_READ_FAILED"; error: unknown; path: string }
   | { code: "LOCAL_AGENTS_WRITE_FAILED"; error: unknown; path: string }
+  | { code: "HASH_FAILED"; error: unknown }
   | { code: "GITIGNORE_UPDATE_FAILED"; error: unknown; path: string }
   | { code: "PROMPT_FAILED"; error: unknown }
   | { code: "PUSH_ABORTED"; error: unknown }
@@ -78,7 +81,7 @@ interface PromptUserInputArgs {
 interface ConfirmOverwriteIfNeededArgs {
   remoteFile?: GistFile;
   remoteName: string;
-  localContent: string;
+  lastSyncedHash?: string;
 }
 
 interface EnsureGitignoreArgs {
@@ -100,6 +103,21 @@ interface UpdateGistFileArgs {
   content: string;
 }
 
+interface PersistGistUrlArgs {
+  configPath: string;
+  gistUrl: string;
+}
+
+interface SaveSyncStateArgs {
+  configPath: string;
+  gistUrl: string;
+  hash: string;
+}
+
+interface HashContentArgs {
+  content: string;
+}
+
 interface ResolveGistArgs {
   gistInput?: string;
   configPath: string;
@@ -108,11 +126,15 @@ interface ResolveGistArgs {
 interface PullAgentsArgs {
   gistId: string;
   cwd: string;
+  configPath: string;
+  gistUrl: string;
 }
 
 interface PushAgentsArgs {
   gistId: string;
   cwd: string;
+  configPath: string;
+  gistUrl: string;
 }
 
 interface RunCommandArgs {
@@ -243,11 +265,19 @@ const parseConfig = (args: ParseConfigArgs) => {
   if (!args.raw || typeof args.raw !== "object") {
     return undefined;
   }
-  const record = args.raw as { gistUrl?: unknown };
+  const record = args.raw as {
+    gistUrl?: unknown;
+    lastSyncedHash?: unknown;
+  };
   if (typeof record.gistUrl !== "string" || record.gistUrl.trim().length === 0) {
     return undefined;
   }
-  return { gistUrl: record.gistUrl };
+  const lastSyncedHash =
+    typeof record.lastSyncedHash === "string" &&
+    record.lastSyncedHash.trim().length > 0
+      ? record.lastSyncedHash
+      : undefined;
+  return { gistUrl: record.gistUrl, lastSyncedHash };
 };
 
 /*
@@ -299,6 +329,50 @@ const saveConfig = async (args: SaveConfigArgs) => {
       path: args.configPath,
     });
   }
+};
+
+/*
+Persists a gist URL while preserving sync metadata when unchanged.
+Inputs: config path and gist URL.
+Outputs: Result signalling success or failure.
+*/
+const persistGistUrl = async (args: PersistGistUrlArgs) => {
+  const existingResult = await loadConfig({ configPath: args.configPath });
+  if (existingResult.isErr()) {
+    return err(existingResult.error);
+  }
+  const existing = existingResult.value;
+  const lastSyncedHash = (() => {
+    if (!existing) {
+      return undefined;
+    }
+    if (existing.gistUrl !== args.gistUrl) {
+      return undefined;
+    }
+    return existing.lastSyncedHash;
+  })();
+  return saveConfig({
+    configPath: args.configPath,
+    config: {
+      gistUrl: args.gistUrl,
+      lastSyncedHash,
+    },
+  });
+};
+
+/*
+Persists the latest sync hash to config.
+Inputs: config path, gist URL, and hash value.
+Outputs: Result signalling success or failure.
+*/
+const saveSyncState = async (args: SaveSyncStateArgs) => {
+  return saveConfig({
+    configPath: args.configPath,
+    config: {
+      gistUrl: args.gistUrl,
+      lastSyncedHash: args.hash,
+    },
+  });
 };
 
 /*
@@ -417,8 +491,26 @@ const promptUserInput = async (args: PromptUserInputArgs) => {
 };
 
 /*
-Checks whether the remote file differs and confirms overwrite when needed.
-Inputs: optional remote file, local content, and remote filename.
+Hashes content for sync tracking.
+Inputs: content string.
+Outputs: Result with a hex hash value.
+*/
+const hashContent = (args: HashContentArgs) => {
+  try {
+    const hash = createHash("sha256");
+    hash.update(args.content);
+    return ok(hash.digest("hex"));
+  } catch (error) {
+    return err({
+      code: "HASH_FAILED",
+      error,
+    });
+  }
+};
+
+/*
+Checks whether the remote file changed since the last sync and confirms overwrite.
+Inputs: optional remote file, remote filename, and last synced hash.
 Outputs: Result indicating whether to proceed with an overwrite.
 */
 const confirmOverwriteIfNeeded = async (
@@ -427,17 +519,24 @@ const confirmOverwriteIfNeeded = async (
   if (!args.remoteFile) {
     return ok(true);
   }
+  if (!args.lastSyncedHash) {
+    return ok(true);
+  }
   const remoteContentResult = await readGistFileContent({
     file: args.remoteFile,
   });
   if (remoteContentResult.isErr()) {
     return err(remoteContentResult.error);
   }
-  if (remoteContentResult.value === args.localContent) {
+  const remoteHashResult = hashContent({ content: remoteContentResult.value });
+  if (remoteHashResult.isErr()) {
+    return err(remoteHashResult.error);
+  }
+  if (remoteHashResult.value === args.lastSyncedHash) {
     return ok(true);
   }
   console.warn(
-    `Warning: remote ${args.remoteName} differs from local ${AGENTS_FILE_NAME}. Continuing will overwrite the remote file with your local version.`,
+    `Warning: remote ${args.remoteName} changed since your last sync. Continuing will overwrite the remote file with your local version.`,
   );
   const promptResult = await promptUserInput({
     prompt: "Continue and overwrite remote? (y/N): ",
@@ -593,9 +692,9 @@ const resolveGist = async (args: ResolveGistArgs) => {
     if (gistIdResult.isErr()) {
       return err(gistIdResult.error);
     }
-    const saveResult = await saveConfig({
+    const saveResult = await persistGistUrl({
       configPath: args.configPath,
-      config: { gistUrl: args.gistInput },
+      gistUrl: args.gistInput,
     });
     if (saveResult.isErr()) {
       return err(saveResult.error);
@@ -618,9 +717,9 @@ const resolveGist = async (args: ResolveGistArgs) => {
     if (gistIdResult.isErr()) {
       return err(gistIdResult.error);
     }
-    const saveResult = await saveConfig({
+    const saveResult = await persistGistUrl({
       configPath: args.configPath,
-      config: { gistUrl: promptResult.value },
+      gistUrl: promptResult.value,
     });
     if (saveResult.isErr()) {
       return err(saveResult.error);
@@ -642,7 +741,7 @@ const resolveGist = async (args: ResolveGistArgs) => {
 
 /*
 Pulls the remote gist file into the local AGENTS.md.
-Inputs: gist id and working directory.
+Inputs: gist id, working directory, config path, and gist URL.
 Outputs: Result indicating whether the pull succeeded.
 */
 const pullAgents = async (args: PullAgentsArgs) => {
@@ -681,19 +780,35 @@ const pullAgents = async (args: PullAgentsArgs) => {
   if (writeResult.isErr()) {
     return err(writeResult.error);
   }
+  const hashResult = hashContent({ content: contentResult.value });
+  if (hashResult.isErr()) {
+    return err(hashResult.error);
+  }
+  const syncResult = await saveSyncState({
+    configPath: args.configPath,
+    gistUrl: args.gistUrl,
+    hash: hashResult.value,
+  });
+  if (syncResult.isErr()) {
+    return err(syncResult.error);
+  }
   console.log(`Updated ${AGENTS_FILE_NAME} from gist.`);
   return ok(undefined);
 };
 
 /*
 Pushes the local AGENTS.md to the remote gist.
-Inputs: gist id and working directory.
+Inputs: gist id, working directory, config path, and gist URL.
 Outputs: Result indicating whether the push succeeded.
 */
 const pushAgents = async (args: PushAgentsArgs) => {
   const localResult = await readLocalAgentsFile({ cwd: args.cwd });
   if (localResult.isErr()) {
     return err(localResult.error);
+  }
+  const localHashResult = hashContent({ content: localResult.value.content });
+  if (localHashResult.isErr()) {
+    return err(localHashResult.error);
   }
   const gistResult = await fetchGist({ gistId: args.gistId });
   if (gistResult.isErr()) {
@@ -703,10 +818,14 @@ const pushAgents = async (args: PushAgentsArgs) => {
     pickAgentsFilename({ files: gistResult.value.files }) ??
     basename(localResult.value.path);
   const remoteFile = gistResult.value.files[remoteName];
+  const configResult = await loadConfig({ configPath: args.configPath });
+  if (configResult.isErr()) {
+    return err(configResult.error);
+  }
   const overwriteResult = await confirmOverwriteIfNeeded({
     remoteFile,
     remoteName,
-    localContent: localResult.value.content,
+    lastSyncedHash: configResult.value?.lastSyncedHash,
   });
   if (overwriteResult.isErr()) {
     return err(overwriteResult.error);
@@ -729,6 +848,14 @@ const pushAgents = async (args: PushAgentsArgs) => {
   if (updateResult.isErr()) {
     return err(updateResult.error);
   }
+  const syncResult = await saveSyncState({
+    configPath: args.configPath,
+    gistUrl: args.gistUrl,
+    hash: localHashResult.value,
+  });
+  if (syncResult.isErr()) {
+    return err(syncResult.error);
+  }
   console.log(`Updated gist ${remoteName} from ${AGENTS_FILE_NAME}.`);
   return ok(undefined);
 };
@@ -742,7 +869,7 @@ const runCommand = async (args: RunCommandArgs) => {
   const configPath = getConfigPath({});
   if (args.command === "set") {
     const gistInputResult = args.gistArg
-      ? ok(args.gistArg)
+      ? ok<string, LagError>(args.gistArg)
       : await promptUserInput({ prompt: "Enter gist URL or id: " });
     if (gistInputResult.isErr()) {
       return err(gistInputResult.error);
@@ -751,9 +878,9 @@ const runCommand = async (args: RunCommandArgs) => {
     if (gistIdResult.isErr()) {
       return err(gistIdResult.error);
     }
-    const saveResult = await saveConfig({
+    const saveResult = await persistGistUrl({
       configPath,
-      config: { gistUrl: gistInputResult.value },
+      gistUrl: gistInputResult.value,
     });
     if (saveResult.isErr()) {
       return err(saveResult.error);
@@ -770,7 +897,12 @@ const runCommand = async (args: RunCommandArgs) => {
     if (gistResult.isErr()) {
       return err(gistResult.error);
     }
-    return pullAgents({ gistId: gistResult.value.gistId, cwd: args.cwd });
+    return pullAgents({
+      gistId: gistResult.value.gistId,
+      cwd: args.cwd,
+      configPath,
+      gistUrl: gistResult.value.gistUrl,
+    });
   }
 
   if (args.command === "push") {
@@ -781,7 +913,12 @@ const runCommand = async (args: RunCommandArgs) => {
     if (gistResult.isErr()) {
       return err(gistResult.error);
     }
-    return pushAgents({ gistId: gistResult.value.gistId, cwd: args.cwd });
+    return pushAgents({
+      gistId: gistResult.value.gistId,
+      cwd: args.cwd,
+      configPath,
+      gistUrl: gistResult.value.gistUrl,
+    });
   }
 
   return err({
@@ -826,6 +963,8 @@ const renderErrorMessage = (args: RenderErrorMessageArgs) => {
       return `Failed to read ${args.error.path}.`;
     case "LOCAL_AGENTS_WRITE_FAILED":
       return `Failed to write ${args.error.path}.`;
+    case "HASH_FAILED":
+      return "Failed to calculate content hash.";
     case "GITIGNORE_UPDATE_FAILED":
       return `Failed to update .gitignore at ${args.error.path}.`;
     case "PROMPT_FAILED":
